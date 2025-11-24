@@ -36,3 +36,12 @@ export async function bookSlot(payload) {
     });
     return res.json();
 }
+
+export async function fetchSlotsAvailability(date) {
+    const res = await fetch(`${API_BASE}/slots-availability`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ date })
+    });
+    return res.json();
+}

@@ -8,6 +8,8 @@ const PORT = 4000;
 // In-memory queues
 const urgentQueue = [];
 const normalQueue = [];
+const completedQueue = []; // Store completed sessions
+const pendingBookings = []; // Store normal path issues waiting for booking
 let currentUrgent = null;
 let currentNormal = null;
 
@@ -50,13 +52,14 @@ app.post("/api/issues", (req, res) => {
     if (path === "critical") {
         urgentQueue.push(issue);
     } else {
-        normalQueue.push(issue);
+        // For normal path, we wait for booking before adding to visible queue
+        pendingBookings.push(issue);
     }
 
     const position =
         path === "critical"
             ? urgentQueue.length
-            : normalQueue.length;
+            : normalQueue.length; // Note: this position might be "theoretical" for normal path until booked
 
     res.json({
         success: true,
@@ -68,13 +71,56 @@ app.post("/api/issues", (req, res) => {
             message:
                 path === "critical"
                     ? "You have been placed in the Critical Path queue."
-                    : "You have been placed in the Normal Path (1-hour block) queue."
+                    : riskLevel === "high"
+                        ? "You have been placed in the Normal Path (High Priority). Please select a time slot."
+                        : "You have been placed in the Normal Path. Please select a time slot."
         },
         preDiagnosis: {
             checklist,
             docsNeeded
         }
     });
+});
+
+const MAX_BOOKINGS_PER_SLOT = 3;
+
+// Helper: count bookings for a specific date/slot
+function getBookingCount(date, slot) {
+    let count = 0;
+    // Check all sources: waiting queues, active sessions, and completed history
+    const allItems = [...urgentQueue, ...normalQueue, ...completedQueue];
+    if (currentUrgent) allItems.push(currentUrgent);
+    if (currentNormal) allItems.push(currentNormal);
+
+    for (const item of allItems) {
+        if (item.bookingDate === date && item.bookingSlot === slot) {
+            count++;
+        }
+    }
+    return count;
+}
+
+app.post("/api/slots-availability", (req, res) => {
+    const { date } = req.body;
+    if (!date) return res.status(400).json({ error: "Date required" });
+
+    // Standard slots as defined in frontend (could be shared, but hardcoded here for prototype)
+    const slots = [
+        "09:00–10:00",
+        "10:00–11:00",
+        "11:00–12:00",
+        "13:00–14:00",
+        "14:00–15:00",
+        "15:00–16:00",
+        "16:00–17:00"
+    ];
+
+    const availability = {};
+    for (const slot of slots) {
+        availability[slot] = getBookingCount(date, slot);
+    }
+
+    res.json({ date, availability, max: MAX_BOOKINGS_PER_SLOT });
 });
 
 // 🔁 Update booking time & slot for an existing issue (Normal Path)
@@ -89,7 +135,33 @@ app.post("/api/book", (req, res) => {
         });
     }
 
-    // Helper to find issue in a queue and update it
+    // Check capacity
+    const currentCount = getBookingCount(bookingDate, bookingSlot);
+    console.log(`🔎 Checking availability for ${bookingDate} ${bookingSlot}: count=${currentCount}/${MAX_BOOKINGS_PER_SLOT}`);
+
+    if (currentCount >= MAX_BOOKINGS_PER_SLOT) {
+         return res.status(400).json({
+            success: false,
+            message: "This time slot is fully booked. Please choose another."
+        });
+    }
+
+    let updated = null;
+
+    // 1. Check pending bookings first (New bookings)
+    const pendingIdx = pendingBookings.findIndex(i => i.id === id);
+    if (pendingIdx !== -1) {
+        const issue = pendingBookings[pendingIdx];
+        issue.bookingDate = bookingDate;
+        issue.bookingSlot = bookingSlot;
+        
+        // Move to real queue
+        normalQueue.push(issue);
+        pendingBookings.splice(pendingIdx, 1);
+        updated = issue;
+    }
+
+    // 2. Helper to find issue in a queue and update it (Rescheduling)
     function updateIssueInQueue(queue) {
         const idx = queue.findIndex((item) => item.id === id);
         if (idx === -1) return null;
@@ -98,12 +170,10 @@ app.post("/api/book", (req, res) => {
         return queue[idx];
     }
 
-    let updated = null;
-
     // Typically only normalQueue should have bookings,
     // but we search both to be safe for demo.
-    updated = updateIssueInQueue(normalQueue) || updated;
-    updated = updateIssueInQueue(urgentQueue) || updated;
+    if (!updated) updated = updateIssueInQueue(normalQueue);
+    if (!updated) updated = updateIssueInQueue(urgentQueue);
 
     // Also check current sessions (in case you book someone already being served)
     if (!updated && currentNormal && currentNormal.id === id) {
@@ -149,7 +219,7 @@ function triageIssue(issueType, description, isUrgent) {
         "missing",
         "locked",
         "blocked",
-        "urgent",
+        // "urgent", // Removed to prevent false positives
         "no money",
         "cannot login"
     ];
@@ -157,8 +227,9 @@ function triageIssue(issueType, description, isUrgent) {
     let path = "normal";
     let riskLevel = "low";
 
+    // If user marks as urgent, we acknowledge high risk, 
+    // but we only route to Critical Path if the issue category validates it.
     if (isUrgent) {
-        path = "critical";
         riskLevel = "high";
     }
 
@@ -171,9 +242,12 @@ function triageIssue(issueType, description, isUrgent) {
         if (text.includes(word)) {
             path = "critical";
             riskLevel = "high";
+            console.log(`[Triage] Keyword match: "${word}" triggered Critical Path`);
             break;
         }
     }
+
+    console.log(`[Triage] Type: ${issueType}, Urgent: ${isUrgent} -> Path: ${path}, Risk: ${riskLevel}`);
 
     // Simple pre-diagnosis: checklist + docs
     let checklist = [];
@@ -258,6 +332,7 @@ app.post("/api/serve", (req, res) => {
     const { queue } = req.body; // "urgent" | "normal"
 
     if (queue === "urgent") {
+        if (currentUrgent) completedQueue.push(currentUrgent); // Archive previous
         currentUrgent = urgentQueue.shift() || null;
         return res.json({
             success: true,
@@ -267,6 +342,7 @@ app.post("/api/serve", (req, res) => {
     }
 
     if (queue === "normal") {
+        if (currentNormal) completedQueue.push(currentNormal); // Archive previous
         currentNormal = normalQueue.shift() || null;
         return res.json({
             success: true,
@@ -282,6 +358,7 @@ app.post("/api/serve", (req, res) => {
 app.post("/api/reset", (req, res) => {
     urgentQueue.length = 0;
     normalQueue.length = 0;
+    completedQueue.length = 0;
     currentUrgent = null;
     currentNormal = null;
     res.json({ success: true });
